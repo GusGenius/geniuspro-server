@@ -11,8 +11,11 @@ The rule-based classifier ships with v1. kNN layer is added as the
 agent swarm collects performance data.
 """
 
+import logging
 import re
 from enum import Enum
+
+logger = logging.getLogger("superintelligence.classifier")
 
 
 class TaskType(Enum):
@@ -101,8 +104,13 @@ class TaskClassifier:
         best_score = scores[best_type]
 
         if best_score < self.MIN_THRESHOLD:
+            logger.debug("Classification: GENERAL (best was %s=%d, below threshold %d)",
+                         best_type.value, best_score, self.MIN_THRESHOLD)
             return TaskType.GENERAL
 
+        logger.info("Classification: %s (score=%d) — scores: %s",
+                     best_type.value, best_score,
+                     ", ".join(f"{k.value}={v}" for k, v in scores.items() if v > 0))
         return best_type
 
     def classify_messages(self, messages: list[dict]) -> TaskType:

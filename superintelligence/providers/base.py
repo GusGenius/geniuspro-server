@@ -31,6 +31,8 @@ class ChatRequest:
     max_tokens: Optional[int] = None
     stop: Optional[list[str]] = None
     stream: bool = False
+    tools: Optional[list[dict]] = None  # Tool definitions in OpenAI format
+    tool_choice: Optional[str] = None  # "auto", "none", or "required"
 
 
 @dataclass
@@ -42,6 +44,7 @@ class ProviderResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str = "stop"
+    tool_calls: Optional[list[dict]] = None  # Tool calls in unified format
 
 
 @dataclass
@@ -53,6 +56,7 @@ class StreamChunk:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     done: bool = False
+    tool_calls_delta: Optional[list[dict]] = None  # Incremental tool call data
 
 
 class BaseProvider(ABC):

@@ -9,6 +9,7 @@ Handles all providers that use the OpenAI API format:
 """
 
 import json
+import logging
 from typing import AsyncIterator
 
 import aiohttp
@@ -20,6 +21,8 @@ from superintelligence.providers.base import (
     StreamChunk,
 )
 
+logger = logging.getLogger("superintelligence.provider.openai")
+
 
 class OpenAICompatProvider(BaseProvider):
     """Provider client for any OpenAI-compatible API."""
@@ -29,6 +32,9 @@ class OpenAICompatProvider(BaseProvider):
         model = self._get_model(request)
         payload = self._build_payload(request, model, stream=False)
 
+        logger.info("[%s] POST %s/chat/completions model=%s msgs=%d",
+                     self.name, self.base_url, model, len(request.messages))
+
         async with self.session.post(
             f"{self.base_url}/chat/completions",
             headers=self._auth_headers(),
@@ -37,20 +43,44 @@ class OpenAICompatProvider(BaseProvider):
         ) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
+                logger.error("[%s] Error %d: %s", self.name, resp.status, error_text[:200])
                 raise RuntimeError(
                     f"Provider {self.name} returned {resp.status}: {error_text}"
                 )
             data = await resp.json()
 
         choice = data.get("choices", [{}])[0]
+        message = choice.get("message", {})
         usage = data.get("usage", {})
 
+        # Extract tool calls if present
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            # Normalize tool calls to unified format
+            normalized_tool_calls = []
+            for tc in tool_calls:
+                normalized_tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": tc.get("function", {}),
+                })
+        else:
+            normalized_tool_calls = None
+
+        p_tok = usage.get("prompt_tokens", 0)
+        c_tok = usage.get("completion_tokens", 0)
+        logger.info("[%s] Response: tokens=%d+%d finish=%s tools=%d",
+                     self.name, p_tok, c_tok,
+                     choice.get("finish_reason", "stop"),
+                     len(normalized_tool_calls) if normalized_tool_calls else 0)
+
         return ProviderResponse(
-            content=choice.get("message", {}).get("content", ""),
+            content=message.get("content", ""),
             model=model,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
+            prompt_tokens=p_tok,
+            completion_tokens=c_tok,
             finish_reason=choice.get("finish_reason", "stop"),
+            tool_calls=normalized_tool_calls,
         )
 
     async def stream_chat_completion(
@@ -60,6 +90,11 @@ class OpenAICompatProvider(BaseProvider):
         model = self._get_model(request)
         payload = self._build_payload(request, model, stream=True)
 
+        logger.info("[%s] STREAM POST %s/chat/completions model=%s msgs=%d",
+                     self.name, self.base_url, model, len(request.messages))
+
+        accumulated_tool_calls = {}  # Track tool calls across chunks
+
         async with self.session.post(
             f"{self.base_url}/chat/completions",
             headers=self._auth_headers(),
@@ -68,6 +103,7 @@ class OpenAICompatProvider(BaseProvider):
         ) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
+                logger.error("[%s] Stream error %d: %s", self.name, resp.status, error_text[:200])
                 raise RuntimeError(
                     f"Provider {self.name} returned {resp.status}: {error_text}"
                 )
@@ -79,7 +115,15 @@ class OpenAICompatProvider(BaseProvider):
 
                 data_str = decoded[6:]  # Strip "data: " prefix
                 if data_str == "[DONE]":
-                    yield StreamChunk(done=True, finish_reason="stop")
+                    # Finalize any accumulated tool calls
+                    tool_calls_list = None
+                    if accumulated_tool_calls:
+                        tool_calls_list = list(accumulated_tool_calls.values())
+                    yield StreamChunk(
+                        done=True,
+                        finish_reason="stop",
+                        tool_calls_delta=tool_calls_list,
+                    )
                     return
 
                 try:
@@ -92,12 +136,38 @@ class OpenAICompatProvider(BaseProvider):
                 finish = choice.get("finish_reason")
                 usage = data.get("usage", {})
 
+                # Handle tool calls in streaming
+                tool_calls_delta = None
+                if "tool_calls" in delta:
+                    for tc in delta["tool_calls"]:
+                        index = tc.get("index", 0)
+                        tool_id = tc.get("id", "")
+                        function_delta = tc.get("function", {})
+
+                        if tool_id not in accumulated_tool_calls:
+                            accumulated_tool_calls[tool_id] = {
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+
+                        if "name" in function_delta:
+                            accumulated_tool_calls[tool_id]["function"]["name"] += function_delta["name"]
+                        if "arguments" in function_delta:
+                            accumulated_tool_calls[tool_id]["function"]["arguments"] += function_delta["arguments"]
+
+                # Only send tool calls on final chunk
+                final_tool_calls = None
+                if finish and accumulated_tool_calls:
+                    final_tool_calls = list(accumulated_tool_calls.values())
+
                 yield StreamChunk(
                     content=delta.get("content", ""),
                     finish_reason=finish,
                     prompt_tokens=usage.get("prompt_tokens", 0),
                     completion_tokens=usage.get("completion_tokens", 0),
                     done=finish is not None,
+                    tool_calls_delta=final_tool_calls,
                 )
 
     def _build_payload(
@@ -122,6 +192,14 @@ class OpenAICompatProvider(BaseProvider):
             payload["max_tokens"] = request.max_tokens
         if request.stop:
             payload["stop"] = request.stop
+
+        # Add tools if present
+        if request.tools:
+            payload["tools"] = request.tools
+            if request.tool_choice:
+                payload["tool_choice"] = request.tool_choice
+            else:
+                payload["tool_choice"] = "auto"
 
         # Request usage in streaming for providers that support it
         if stream:

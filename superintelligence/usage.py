@@ -5,9 +5,12 @@ Logs every request to Supabase usage_logs table for billing and analytics.
 Tracks provider used internally but never exposes it to the client.
 """
 
+import logging
 import traceback
 
 import aiohttp
+
+logger = logging.getLogger("superintelligence.usage")
 
 
 def _supa_headers(service_key: str) -> dict[str, str]:
@@ -61,6 +64,10 @@ async def log_usage(
         ) as resp:
             if resp.status >= 400:
                 text = await resp.text()
-                print(f"Usage log failed ({resp.status}): {text}")
+                logger.error("Usage log failed (%d): %s", resp.status, text[:200])
+            else:
+                logger.debug("Usage logged: user=%s provider=%s tokens=%d time=%dms",
+                             user_id[:8], provider_used or "?",
+                             prompt_tokens + completion_tokens, response_time_ms)
     except Exception:
-        traceback.print_exc()
+        logger.error("Usage log error", exc_info=True)

@@ -9,6 +9,7 @@ Runs on port 8000. Nginx routes all traffic here.
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 import traceback
@@ -19,6 +20,15 @@ from fastapi import FastAPI, Request, WebSocket, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("gateway")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -48,8 +58,8 @@ async def startup():
     global _http_session
     _http_session = aiohttp.ClientSession()
     if not SUPABASE_SERVICE_KEY:
-        print("WARNING: SUPABASE_SERVICE_KEY not set -- auth will fail")
-    print("GeniusPro API Gateway ready on :8000")
+        logger.warning("SUPABASE_SERVICE_KEY not set — auth will fail")
+    logger.info("GeniusPro API Gateway ready on :8000")
 
 
 @app.on_event("shutdown")
@@ -165,13 +175,16 @@ async def log_usage(
 async def require_auth(request: Request) -> dict:
     raw_key = extract_api_key(request)
     if not raw_key:
+        logger.warning("Auth failed: no API key provided from %s", request.client.host if request.client else "?")
         raise HTTPException(
             status_code=401,
             detail="API key required. Use X-API-Key header or Authorization: Bearer.",
         )
     key_info = await validate_key(raw_key)
     if not key_info:
+        logger.warning("Auth failed: invalid key from %s", request.client.host if request.client else "?")
         raise HTTPException(status_code=401, detail="Invalid or inactive API key.")
+    logger.info("Auth OK: user=%s key=%s", key_info.get("user_id", "?")[:8], key_info.get("id", "?")[:8])
     return key_info
 
 
@@ -216,6 +229,9 @@ async def chat_completions(
     messages = body.get("messages", [])
     stream = body.get("stream", False)
 
+    logger.info("Gateway /v1/chat/completions model=%s stream=%s msgs=%d user=%s",
+                model, stream, len(messages), key_info.get("user_id", "?")[:8])
+
     # Build Ollama payload
     ollama_payload = {"model": model, "messages": messages, "stream": stream}
 
@@ -249,6 +265,8 @@ async def chat_completions(
     prompt_tokens = result.get("prompt_eval_count", 0) or 0
     completion_tokens = result.get("eval_count", 0) or 0
     elapsed = int((time.time() - start) * 1000)
+
+    logger.info("Gateway complete: model=%s tokens=%d+%d time=%dms", model, prompt_tokens, completion_tokens, elapsed)
 
     asyncio.create_task(
         log_usage(
@@ -336,39 +354,69 @@ async def _stream_chat(ollama_payload, key_info, model, start):
 
 # ─── Voice WebSocket ─────────────────────────────────────────────────────────
 
+async def validate_jwt_token(token: str) -> Optional[dict]:
+    """Validate Supabase JWT token and return user info."""
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        async with _http_session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            user_data = await resp.json()
+            return {
+                "id": f"jwt-{user_data.get('id')}",  # Fake API key ID for logging
+                "user_id": user_data.get("id"),
+                "rate_limit_rpm": 1000,  # Default limits for JWT users
+                "rate_limit_tpm": 100000,
+            }
+    except Exception:
+        return None
+
+
 @app.websocket("/v1/voice")
 async def voice_proxy(ws: WebSocket):
     """
     Auth then bidirectional proxy to voice server.
-    Key via query param: /v1/voice?api_key=sk-gp-...
-    Or first message:   {"type": "auth", "api_key": "sk-gp-..."}
+    Supports:
+    - API key: /v1/voice?api_key=sk-gp-...
+    - JWT token: /v1/voice?token=eyJ...
+    - Auth message: {"type": "auth", "api_key": "..."} or {"type": "auth", "token": "..."}
     """
     await ws.accept()
+    logger.info("Voice WS connected from %s", ws.client.host if ws.client else "?")
 
-    # Try query param
+    # Try query params
     raw_key = ws.query_params.get("api_key")
+    token = ws.query_params.get("token")
 
-    if not raw_key:
+    if not raw_key and not token:
         # Wait for auth message
         try:
             first_msg = await asyncio.wait_for(ws.receive_text(), timeout=10)
             data = json.loads(first_msg)
             if data.get("type") == "auth":
                 raw_key = data.get("api_key")
+                token = data.get("token")
         except Exception:
             pass
 
-    if not raw_key:
-        await ws.send_text(json.dumps({"type": "error", "message": "API key required"}))
-        await ws.close(code=1008)
-        return
+    # Validate auth
+    key_info = None
+    if token:
+        key_info = await validate_jwt_token(token)
+    elif raw_key:
+        key_info = await validate_key(raw_key)
 
-    key_info = await validate_key(raw_key)
     if not key_info:
-        await ws.send_text(json.dumps({"type": "error", "message": "Invalid API key"}))
+        logger.warning("Voice WS auth failed — closing")
+        await ws.send_text(json.dumps({"type": "error", "message": "Authentication required"}))
         await ws.close(code=1008)
         return
 
+    logger.info("Voice WS authenticated: user=%s", key_info.get("user_id", "?")[:8])
     # Proxy to backend voice server
     voice_ws_url = (
         VOICE_SERVER_URL.replace("http://", "ws://").replace("https://", "wss://")
@@ -411,8 +459,8 @@ async def voice_proxy(ws: WebSocket):
 
             await asyncio.gather(client_to_backend(), backend_to_client())
 
-    except Exception:
-        traceback.print_exc()
+    except Exception as exc:
+        logger.error("Voice WS proxy error: %s", exc, exc_info=True)
         try:
             await ws.send_text(
                 json.dumps({"type": "error", "message": "Voice server unavailable"})
@@ -421,6 +469,7 @@ async def voice_proxy(ws: WebSocket):
             pass
     finally:
         elapsed = int((time.time() - start) * 1000)
+        logger.info("Voice WS session ended: user=%s duration=%dms", key_info.get("user_id", "?")[:8], elapsed)
         await log_usage(
             key_info["id"],
             key_info["user_id"],

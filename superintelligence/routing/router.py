@@ -9,11 +9,14 @@ The router picks the provider with the highest score for the given task.
 Includes fallback chain if the primary provider fails.
 """
 
+import logging
 import random
 from typing import Optional
 
 from superintelligence.providers.base import BaseProvider
 from superintelligence.routing.classifier import TaskClassifier, TaskType
+
+logger = logging.getLogger("superintelligence.router")
 
 
 # ── Benchmark-seeded scores (0-100) per provider per task ────────────────────
@@ -142,7 +145,7 @@ class SuperintelligenceRouter:
         """Register a provider with the router."""
         self.providers[provider.name] = provider
         self._provider_health[provider.name] = True
-        print(f"  Registered provider: {provider.name} ({provider.default_model})")
+        logger.info("Registered provider: %s (model=%s)", provider.name, provider.default_model)
 
     def classify(self, messages: list[dict]) -> TaskType:
         """Classify the task type from messages."""
@@ -175,11 +178,14 @@ class SuperintelligenceRouter:
             candidates.append((name, score + random.uniform(0, 0.1)))
 
         if not candidates:
+            logger.warning("No candidates for task_type=%s (exclude=%s)", task_type.value, exclude)
             return None
 
         # Sort by score descending, pick the best
         candidates.sort(key=lambda x: x[1], reverse=True)
         best_name = candidates[0][0]
+        top3 = ", ".join(f"{n}={s:.0f}" for n, s in candidates[:3])
+        logger.info("Selected provider %s for %s (top: %s)", best_name, task_type.value, top3)
         return self.providers[best_name]
 
     def get_fallback_chain(
@@ -204,12 +210,12 @@ class SuperintelligenceRouter:
     def mark_unhealthy(self, provider_name: str) -> None:
         """Mark a provider as unhealthy (called by Latency Agent)."""
         self._provider_health[provider_name] = False
-        print(f"  Provider marked unhealthy: {provider_name}")
+        logger.warning("Provider marked unhealthy: %s", provider_name)
 
     def mark_healthy(self, provider_name: str) -> None:
         """Mark a provider as healthy again."""
         self._provider_health[provider_name] = True
-        print(f"  Provider marked healthy: {provider_name}")
+        logger.info("Provider marked healthy: %s", provider_name)
 
     def update_score(
         self, provider_name: str, task_type: TaskType, new_score: float
