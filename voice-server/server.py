@@ -400,13 +400,53 @@ async def voice_endpoint(ws: WebSocket):
             ),
         })
 
+        async def speak_text(text: str):
+            """Generate TTS for text and stream audio back to client."""
+            await ws.send_text(json.dumps({"type": "status", "state": "speaking"}))
+            await ws.send_text(json.dumps({"type": "response", "text": text}))
+
+            stop_event = threading.Event()
+
+            def generate_audio():
+                return list(tts.stream(text, stop_event=stop_event))
+
+            audio_chunks = await asyncio.to_thread(generate_audio)
+
+            for chunk in audio_chunks:
+                if ws.client_state != WebSocketState.CONNECTED:
+                    break
+                pcm_bytes = tts.chunk_to_pcm16(chunk)
+                await ws.send_bytes(pcm_bytes)
+
+            await ws.send_text(json.dumps({"type": "audio_end"}))
+            await ws.send_text(json.dumps({"type": "status", "state": "idle"}))
+
         try:
             while True:
                 try:
-                    data = await ws.receive_bytes()
+                    msg = await ws.receive()
                 except WebSocketDisconnect:
                     print("[voice] Client disconnected")
                     break
+
+                # Handle text messages (e.g. greeting request)
+                if msg.get("type") == "websocket.receive" and msg.get("text"):
+                    try:
+                        payload = json.loads(msg["text"])
+                        if payload.get("type") == "greeting":
+                            greeting_text = payload.get("text", "Hello!")
+                            print(f"[voice] Speaking greeting: {greeting_text}")
+                            conversation_history.append({"role": "assistant", "content": greeting_text})
+                            await speak_text(greeting_text)
+                            continue
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                    continue
+
+                # Handle binary audio data
+                data = msg.get("bytes")
+                if not data:
+                    continue
 
                 # Feed audio to VAD
                 speech_audio = vad.process_chunk(data)
@@ -443,25 +483,8 @@ async def voice_endpoint(ws: WebSocket):
                 conversation_history.append({"role": "assistant", "content": full_response})
                 print(f"[voice] Response: {full_response[:100]}...")
 
-                await ws.send_text(json.dumps({"type": "response", "text": full_response}))
-
                 # 3. Generate speech and stream back
-                stop_event = threading.Event()
-
-                def generate_audio():
-                    return list(tts.stream(full_response, stop_event=stop_event))
-
-                audio_chunks = await asyncio.to_thread(generate_audio)
-
-                for chunk in audio_chunks:
-                    if ws.client_state != WebSocketState.CONNECTED:
-                        break
-                    pcm_bytes = tts.chunk_to_pcm16(chunk)
-                    await ws.send_bytes(pcm_bytes)
-
-                # Signal end of audio
-                await ws.send_text(json.dumps({"type": "audio_end"}))
-                await ws.send_text(json.dumps({"type": "status", "state": "idle"}))
+                await speak_text(full_response)
 
         except Exception as e:
             print(f"[voice] Error: {e}")

@@ -41,6 +41,11 @@ logger = logging.getLogger("superintelligence")
 
 MODEL_NAME = "geniuspro-superintelligence-v1"
 API_PREFIX = "/super-intelligence/v1"
+DEFAULT_SYSTEM_PROMPT = (
+    "You are GeniusPro, a helpful AI assistant created by GeniusPro. "
+    "Be concise, friendly, and helpful. Never identify as any other AI or company. "
+    "If the user asks who you are, say you are GeniusPro."
+)
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -184,6 +189,10 @@ async def chat_completions(request: Request):
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
+    # Inject default system prompt if client didn't provide one
+    if messages[0].get("role") != "system":
+        messages.insert(0, {"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
+
     # Merge client tools with built-in tools
     all_tools = []
     if client_tools:
@@ -303,7 +312,6 @@ async def _complete_with_fallback(
                         tool_name = tc.get("function", {}).get("name", "")
                         tool_args_str = tc.get("function", {}).get("arguments", "{}")
                         try:
-                            import json
                             tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
                             tool_result = await _tool_registry.execute(tool_name, tool_args)
                             
@@ -482,7 +490,6 @@ async def _stream_with_fallback(
                                     tool_args_str = tc.get("function", {}).get("arguments", "{}")
                                     logger.info("[%s] Executing server tool: %s", req_id, tool_name)
                                     try:
-                                        import json
                                         tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
                                         tool_result = await _tool_registry.execute(tool_name, tool_args)
                                         
