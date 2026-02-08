@@ -113,7 +113,7 @@ async def validate_key(raw_key: str) -> Optional[dict]:
     url = (
         f"{SUPABASE_URL}/rest/v1/api_keys"
         f"?key_hash=eq.{key_h}&is_active=eq.true"
-        f"&select=id,user_id,rate_limit_rpm,rate_limit_tpm"
+        f"&select=id,user_id,profile,rate_limit_rpm,rate_limit_tpm"
     )
     async with _http_session.get(url, headers=_supa_headers()) as resp:
         if resp.status != 200:
@@ -185,7 +185,20 @@ async def require_auth(request: Request) -> dict:
         logger.warning("Auth failed: invalid key from %s", request.client.host if request.client else "?")
         raise HTTPException(status_code=401, detail="Invalid or inactive API key.")
     logger.info("Auth OK: user=%s key=%s", key_info.get("user_id", "?")[:8], key_info.get("id", "?")[:8])
+    _enforce_api_key_profile(key_info, request.url.path)
     return key_info
+
+
+def _enforce_api_key_profile(key_info: dict, path: str) -> None:
+    profile = (key_info.get("profile") or "universal").strip()
+    if profile == "universal":
+        return
+    if profile == "openai_compat":
+        return
+    # Coding Superintelligence keys are not valid for the gateway /v1 surface.
+    if profile == "coding_superintelligence":
+        raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
+    raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────

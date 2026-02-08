@@ -15,6 +15,7 @@ from typing import Optional
 
 from superintelligence.providers.base import BaseProvider
 from superintelligence.routing.classifier import TaskClassifier, TaskType
+from superintelligence.coding.language_classifier import CodingLanguage
 
 logger = logging.getLogger("superintelligence.router")
 
@@ -123,6 +124,89 @@ DEFAULT_SCORES: dict[str, dict[TaskType, float]] = {
     },
 }
 
+# ── Cursor coding: language-aware routing (heuristic) ─────────────────────────
+#
+# Public benchmarks are still mostly Python-heavy (SWE-bench, LiveCodeBench) and
+# aggregate across languages (Aider Polyglot). Multi-LCB (ICLR 2026) shows
+# substantial disparities across languages, so we encode a small heuristic
+# profile for Cursor coding flows. These values can be tuned over time.
+#
+# If a provider isn't listed for a language, we fall back to DEFAULT_SCORES[CODE].
+CODE_LANGUAGE_PROVIDER_SCORES: dict[CodingLanguage, dict[str, float]] = {
+    CodingLanguage.PYTHON: {
+        "anthropic": 99.0,
+        "openai": 97.0,
+        "deepseek": 95.0,
+        "openrouter-deepseek": 95.0,
+        "google": 93.0,
+        "openrouter-google": 93.0,
+    },
+    CodingLanguage.TYPESCRIPT: {
+        "openai": 99.0,
+        "anthropic": 97.0,
+        "google": 95.0,
+        "openrouter-google": 95.0,
+        "deepseek": 92.0,
+        "openrouter-deepseek": 92.0,
+    },
+    CodingLanguage.JAVASCRIPT: {
+        "openai": 99.0,
+        "anthropic": 97.0,
+        "google": 95.0,
+        "openrouter-google": 95.0,
+        "deepseek": 92.0,
+        "openrouter-deepseek": 92.0,
+    },
+    CodingLanguage.RUST: {
+        "deepseek": 97.0,
+        "openrouter-deepseek": 97.0,
+        "openai": 96.0,
+        "anthropic": 92.0,
+        "google": 90.0,
+        "openrouter-google": 90.0,
+    },
+    CodingLanguage.CPP: {
+        "deepseek": 97.0,
+        "openrouter-deepseek": 97.0,
+        "openai": 96.0,
+        "anthropic": 92.0,
+        "google": 90.0,
+        "openrouter-google": 90.0,
+    },
+    CodingLanguage.GO: {
+        "deepseek": 96.0,
+        "openrouter-deepseek": 96.0,
+        "openai": 95.0,
+        "anthropic": 92.0,
+        "google": 91.0,
+        "openrouter-google": 91.0,
+    },
+    CodingLanguage.JAVA: {
+        "openai": 97.0,
+        "google": 96.0,
+        "openrouter-google": 96.0,
+        "anthropic": 94.0,
+        "deepseek": 92.0,
+        "openrouter-deepseek": 92.0,
+    },
+    CodingLanguage.CSHARP: {
+        "openai": 97.0,
+        "google": 95.0,
+        "openrouter-google": 95.0,
+        "anthropic": 94.0,
+        "deepseek": 92.0,
+        "openrouter-deepseek": 92.0,
+    },
+    CodingLanguage.SQL: {
+        "openai": 97.0,
+        "deepseek": 96.0,
+        "openrouter-deepseek": 96.0,
+        "anthropic": 94.0,
+        "google": 92.0,
+        "openrouter-google": 92.0,
+    },
+}
+
 
 class SuperintelligenceRouter:
     """
@@ -152,7 +236,10 @@ class SuperintelligenceRouter:
         return self.classifier.classify_messages(messages)
 
     def select_provider(
-        self, task_type: TaskType, exclude: Optional[set[str]] = None
+        self,
+        task_type: TaskType,
+        exclude: Optional[set[str]] = None,
+        code_language: Optional[CodingLanguage] = None,
     ) -> Optional[BaseProvider]:
         """
         Select the best provider for a task type.
@@ -174,6 +261,10 @@ class SuperintelligenceRouter:
                 continue
 
             score = self.scores.get(name, {}).get(task_type, 50.0)
+            if task_type == TaskType.CODE and code_language and code_language != CodingLanguage.UNKNOWN:
+                lang_scores = CODE_LANGUAGE_PROVIDER_SCORES.get(code_language)
+                if lang_scores and name in lang_scores:
+                    score = lang_scores[name]
             # Add small random jitter to break ties
             candidates.append((name, score + random.uniform(0, 0.1)))
 
@@ -189,7 +280,10 @@ class SuperintelligenceRouter:
         return self.providers[best_name]
 
     def get_fallback_chain(
-        self, task_type: TaskType, max_fallbacks: int = 3
+        self,
+        task_type: TaskType,
+        max_fallbacks: int = 3,
+        code_language: Optional[CodingLanguage] = None,
     ) -> list[BaseProvider]:
         """
         Get an ordered list of providers for a task type (best first).
@@ -199,7 +293,7 @@ class SuperintelligenceRouter:
         exclude: set[str] = set()
 
         for _ in range(max_fallbacks):
-            provider = self.select_provider(task_type, exclude=exclude)
+            provider = self.select_provider(task_type, exclude=exclude, code_language=code_language)
             if provider is None:
                 break
             chain.append(provider)

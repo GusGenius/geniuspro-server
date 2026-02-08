@@ -80,7 +80,7 @@ async def validate_key(
     url = (
         f"{supabase_url}/rest/v1/api_keys"
         f"?key_hash=eq.{key_h}&is_active=eq.true"
-        f"&select=id,user_id,rate_limit_rpm,rate_limit_tpm"
+        f"&select=id,user_id,profile,rate_limit_rpm,rate_limit_tpm"
     )
 
     try:

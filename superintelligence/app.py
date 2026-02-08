@@ -3,8 +3,6 @@
 Routes chat completion requests to the best expert model via Macro-MoE.
 """
 
-import asyncio
-import json
 import logging
 import time
 import uuid
@@ -17,16 +15,34 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from superintelligence.agents.swarm import AgentSwarm
 from superintelligence.auth import require_auth
+from superintelligence.coding.language_classifier import CodingLanguage, detect_coding_language
+from superintelligence.coding.memory_store import MemorySnippet, list_snippets, save_snippet
+from superintelligence.coding.onboarding import build_onboarding_response
+from superintelligence.coding.prompts import (
+    CODING_FIRST_TURN_BOOTSTRAP_PROMPT,
+    CODING_PROTOCOL_SYSTEM_PROMPT,
+)
+from superintelligence.coding.summarize import build_summarize_messages
+from superintelligence.coding.tool_contract import (
+    get_cursor_coding_tool_definitions,
+    merge_client_tools,
+)
 from superintelligence.config import load_config, SuperintelligenceConfig
-from superintelligence.providers.base import ChatMessage, ChatRequest, StreamChunk
+from superintelligence.http.completion_service import (
+    CompletionContext,
+    build_chat_request,
+    complete_with_fallback,
+    inject_system_message,
+    merge_tools,
+    stream_with_fallback,
+)
 from superintelligence.providers.openai_compat import OpenAICompatProvider
 from superintelligence.providers.anthropic_provider import AnthropicProvider
+from superintelligence.routing.classifier import TaskType
 from superintelligence.routing.router import SuperintelligenceRouter
 from superintelligence.tools.registry import ToolRegistry
 from superintelligence.tools.web_search import WebSearchTool
 from superintelligence.tools.url_fetch import URLFetchTool
-from superintelligence.tools.provider_mapper import ProviderToolMapper
-from superintelligence.usage import log_usage
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -175,16 +191,16 @@ async def list_models(request: Request) -> dict:
 async def chat_completions(request: Request):
     req_id = uuid.uuid4().hex[:8]
     key_info = await _auth(request)
+    _enforce_api_key_profile(key_info, request.url.path)
     start = time.time()
 
     body = await request.json()
     messages = body.get("messages", [])
-    stream = body.get("stream", False)
     client_tools = body.get("tools", [])  # Client-defined tools
 
     last_msg = messages[-1].get("content", "")[:80] if messages else ""
     logger.info("[%s] ── New request ── user=%s stream=%s msgs=%d last_msg='%s'",
-                req_id, key_info.get("user_id", "?")[:8], stream, len(messages), last_msg)
+                req_id, key_info.get("user_id", "?")[:8], bool(body.get("stream", False)), len(messages), last_msg)
 
     if not messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -193,19 +209,215 @@ async def chat_completions(request: Request):
     if messages[0].get("role") != "system":
         messages.insert(0, {"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
 
-    # Merge client tools with built-in tools
-    all_tools = []
-    if client_tools:
-        all_tools.extend(client_tools)
-    if _tool_registry:
-        all_tools.extend(_tool_registry.get_definitions())
-
     # Classify the task
-    task_type = _router.classify(messages)
+    task_type = _router.classify(messages) if _router else TaskType.GENERAL
     logger.info("[%s] Task classified as: %s", req_id, task_type.value)
 
-    # Get fallback chain (best provider first, then alternatives)
-    chain = _router.get_fallback_chain(task_type)
+    return await _run_completion(
+        body=body,
+        messages=messages,
+        client_tools=client_tools,
+        task_type=task_type,
+        key_info=key_info,
+        start=start,
+        req_id=req_id,
+        endpoint=f"{API_PREFIX}/chat/completions",
+    )
+
+
+# ─── Coding-specific Superintelligence ───────────────────────────────────────
+
+@app.post(f"{API_PREFIX}/coding/chat/completions", response_model=None)
+async def coding_chat_completions(request: Request):
+    req_id = uuid.uuid4().hex[:8]
+    key_info = await _auth(request)
+    _enforce_api_key_profile(key_info, request.url.path)
+    start = time.time()
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    request_tools = body.get("tools", [])
+
+    # If the client starts a new session with no user message yet,
+    # return the onboarding question immediately.
+    if not messages:
+        return JSONResponse(build_onboarding_response(model_name=MODEL_NAME))
+
+    if messages[0].get("role") != "system":
+        messages.insert(0, {"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
+
+    inject_system_message(messages, CODING_PROTOCOL_SYSTEM_PROMPT)
+    if _is_first_turn(messages):
+        inject_system_message(messages, CODING_FIRST_TURN_BOOTSTRAP_PROMPT)
+
+    enable_cursor_tools = body.get("enable_cursor_tools", True)
+    injected_tools = get_cursor_coding_tool_definitions() if enable_cursor_tools else []
+    client_tools = merge_client_tools(request_tools=request_tools, injected_tools=injected_tools)
+
+    # Allow explicit override; otherwise detect from messages.
+    requested_language = body.get("coding_language")
+    detected_language = detect_coding_language(messages)
+    coding_language = detected_language
+    if isinstance(requested_language, str):
+        try:
+            coding_language = CodingLanguage(requested_language.lower())
+        except Exception:
+            coding_language = detected_language
+
+    return await _run_completion(
+        body=body,
+        messages=messages,
+        client_tools=client_tools,
+        task_type=TaskType.CODE,
+        code_language=coding_language,
+        key_info=key_info,
+        start=start,
+        req_id=req_id,
+        endpoint=f"{API_PREFIX}/coding/chat/completions",
+    )
+
+
+@app.post(f"{API_PREFIX}/coding/summarize", response_model=None)
+async def coding_summarize(request: Request):
+    req_id = uuid.uuid4().hex[:8]
+    key_info = await _auth(request)
+    _enforce_api_key_profile(key_info, request.url.path)
+    start = time.time()
+
+    body = await request.json()
+    summary_type = body.get("type")
+    content = body.get("content")
+    instructions = body.get("instructions")
+
+    if summary_type not in {"diff", "session", "file_or_folder", "selection"}:
+        raise HTTPException(
+            status_code=400,
+            detail="type is required and must be one of: diff, session, file_or_folder, selection",
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+
+    messages = build_summarize_messages(
+        summary_type=summary_type,
+        content=content,
+        instructions=instructions if isinstance(instructions, str) else None,
+    )
+
+    client_tools = body.get("tools", [])
+    return await _run_completion(
+        body=body,
+        messages=messages,
+        client_tools=client_tools,
+        task_type=TaskType.CODE,
+        code_language=CodingLanguage.UNKNOWN,
+        key_info=key_info,
+        start=start,
+        req_id=req_id,
+        endpoint=f"{API_PREFIX}/coding/summarize",
+    )
+
+
+# ─── Coding memory (user-approved snippets only) ─────────────────────────────
+
+@app.post(f"{API_PREFIX}/coding/memory/snippets", response_model=None)
+async def coding_memory_save_snippet(request: Request):
+    key_info = await _auth(request)
+    _enforce_api_key_profile(key_info, request.url.path)
+    if not _config or not _session:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    body = await request.json()
+    approved = body.get("approved")
+    project_slug = body.get("project_slug")
+    content = body.get("content")
+    language = body.get("language")
+    tags = body.get("tags")
+    workspace_fingerprint = body.get("workspace_fingerprint")
+
+    if approved is not True:
+        raise HTTPException(status_code=400, detail="approved=true is required")
+    if not isinstance(project_slug, str) or not project_slug.strip():
+        raise HTTPException(status_code=400, detail="project_slug is required")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(status_code=400, detail="content is required")
+    # Hard safety limit: we do not want to store large code blocks by accident.
+    if len(content) > 8000:
+        raise HTTPException(status_code=400, detail="content too large (max 8000 chars)")
+    if tags is not None and not isinstance(tags, list):
+        raise HTTPException(status_code=400, detail="tags must be an array of strings")
+
+    snippet = MemorySnippet(
+        user_id=key_info["user_id"],
+        project_slug=project_slug.strip(),
+        content=content,
+        language=language if isinstance(language, str) else None,
+        tags=[t[:64] for t in tags if isinstance(t, str) and t.strip()][:20] if isinstance(tags, list) else None,
+        workspace_fingerprint=workspace_fingerprint if isinstance(workspace_fingerprint, str) else None,
+    )
+    try:
+        row = await save_snippet(
+            session=_session,
+            supabase_url=_config.supabase_url,
+            supabase_service_key=_config.supabase_service_key,
+            snippet=snippet,
+        )
+        return JSONResponse({"ok": True, "snippet": row})
+    except Exception as e:
+        # Handle duplicate inserts cleanly.
+        msg = str(e)
+        if "coding_memory_snippets_dedupe_idx" in msg or "duplicate key value" in msg:
+            return JSONResponse({"ok": True, "duplicate": True})
+        raise HTTPException(status_code=502, detail=msg)
+
+
+@app.get(f"{API_PREFIX}/coding/memory/snippets", response_model=None)
+async def coding_memory_list_snippets(request: Request):
+    key_info = await _auth(request)
+    _enforce_api_key_profile(key_info, request.url.path)
+    if not _config or not _session:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    project_slug = request.query_params.get("project_slug", "")
+    limit_raw = request.query_params.get("limit", "20")
+    try:
+        limit = int(limit_raw)
+    except Exception:
+        limit = 20
+
+    if not project_slug.strip():
+        raise HTTPException(status_code=400, detail="project_slug is required")
+
+    try:
+        rows = await list_snippets(
+            session=_session,
+            supabase_url=_config.supabase_url,
+            supabase_service_key=_config.supabase_service_key,
+            user_id=key_info["user_id"],
+            project_slug=project_slug.strip(),
+            limit=limit,
+        )
+        return JSONResponse({"ok": True, "snippets": rows})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+async def _run_completion(
+    *,
+    body: dict,
+    messages: list[dict],
+    client_tools: list[dict],
+    task_type: TaskType,
+    code_language: CodingLanguage = CodingLanguage.UNKNOWN,
+    key_info: dict,
+    start: float,
+    req_id: str,
+    endpoint: str,
+):
+    if not _config or not _session or not _router:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    all_tools = merge_tools(client_tools=client_tools, tool_registry=_tool_registry)
+    chain = _router.get_fallback_chain(task_type, code_language=code_language)
     if not chain:
         logger.error("[%s] No providers available for task_type=%s", req_id, task_type.value)
         raise HTTPException(status_code=503, detail="No providers available")
@@ -213,394 +425,90 @@ async def chat_completions(request: Request):
     chain_names = [p.name for p in chain]
     logger.info("[%s] Fallback chain: %s", req_id, " → ".join(chain_names))
 
-    # Build the normalized request
-    chat_request = ChatRequest(
-        messages=[ChatMessage(role=m["role"], content=m["content"]) for m in messages],
-        temperature=body.get("temperature"),
-        top_p=body.get("top_p"),
-        max_tokens=body.get("max_tokens"),
-        stop=body.get("stop"),
-        stream=stream,
-        tools=all_tools if all_tools else None,
-        tool_choice=body.get("tool_choice", "auto" if all_tools else None),
+    chat_request = build_chat_request(messages=messages, body=body, tools=all_tools)
+    ctx = CompletionContext(
+        config=_config,
+        session=_session,
+        router=_router,
+        tool_registry=_tool_registry,
+        model_name=MODEL_NAME,
     )
 
-    if stream:
+    if chat_request.stream:
         return StreamingResponse(
-            _stream_with_fallback(chat_request, chain, key_info, task_type, start, client_tools, req_id),
+            stream_with_fallback(
+                ctx=ctx,
+                chat_request=chat_request,
+                chain=chain,
+                key_info=key_info,
+                task_type=task_type,
+                start=start,
+                client_tools=client_tools,
+                req_id=req_id,
+                endpoint=endpoint,
+            ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    # Non-streaming with fallback
-    return await _complete_with_fallback(
-        chat_request, chain, key_info, task_type, start, client_tools, req_id
+    response_data = await complete_with_fallback(
+        ctx=ctx,
+        chat_request=chat_request,
+        chain=chain,
+        key_info=key_info,
+        task_type=task_type,
+        start=start,
+        client_tools=client_tools,
+        req_id=req_id,
+        endpoint=endpoint,
     )
+    return JSONResponse(response_data)
 
 
-# ─── Non-streaming with fallback ─────────────────────────────────────────────
-
-async def _complete_with_fallback(
-    chat_request: ChatRequest,
-    chain: list,
-    key_info: dict,
-    task_type,
-    start: float,
-    client_tools: list,
-    req_id: str = "",
-) -> JSONResponse:
-    """Try providers in order until one succeeds. Handles tool execution loop."""
-    last_error = ""
-
-    original_tools = list(chat_request.tools) if chat_request.tools else None
-
-    for provider in chain:
-        try:
-            logger.info("[%s] Trying provider: %s (model=%s)", req_id, provider.name, provider.default_model)
-            chat_request.model = provider.default_model
-            
-            # Convert tools to provider format (use copy so fallback gets original)
-            if original_tools:
-                chat_request.tools = ProviderToolMapper.to_provider_format(
-                    original_tools, provider.name
-                )
-            else:
-                chat_request.tools = None
-
-            # Tool execution loop (max 5 iterations to prevent infinite loops)
-            max_iterations = 5
-            conversation_messages = list(chat_request.messages)
-            final_content = ""
-            final_tool_calls = None
-            final_finish_reason = "stop"
-            total_prompt_tokens = 0
-            total_completion_tokens = 0
-
-            for iteration in range(max_iterations):
-                logger.debug("[%s] Tool iteration %d/%d", req_id, iteration + 1, max_iterations)
-                # Update messages for this iteration
-                chat_request.messages = conversation_messages
-                
-                result = await provider.chat_completion(chat_request)
-                total_prompt_tokens += result.prompt_tokens
-                total_completion_tokens += result.completion_tokens
-                final_content = result.content
-                final_tool_calls = result.tool_calls
-                final_finish_reason = result.finish_reason
-
-                # If no tool calls, we're done
-                if not result.tool_calls:
-                    break
-
-                # Separate server-side and client-side tool calls
-                server_tool_calls = []
-                client_tool_calls = []
-                client_tool_names = {tool.get("function", {}).get("name") for tool in client_tools if tool.get("type") == "function"}
-
-                for tc in result.tool_calls:
-                    tool_name = tc.get("function", {}).get("name", "")
-                    if _tool_registry and _tool_registry.is_server_tool(tool_name):
-                        # Check if provider handles it natively
-                        if not ProviderToolMapper.is_native_tool(tool_name, provider.name):
-                            server_tool_calls.append(tc)
-                    elif tool_name in client_tool_names:
-                        client_tool_calls.append(tc)
-
-                # Execute server-side tools
-                if server_tool_calls:
-                    for tc in server_tool_calls:
-                        tool_name = tc.get("function", {}).get("name", "")
-                        tool_args_str = tc.get("function", {}).get("arguments", "{}")
-                        try:
-                            tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                            tool_result = await _tool_registry.execute(tool_name, tool_args)
-                            
-                            # Add tool result to conversation
-                            conversation_messages.append(ChatMessage(
-                                role="assistant",
-                                content="",  # Tool calls don't have text content
-                            ))
-                            conversation_messages.append(ChatMessage(
-                                role="tool",
-                                content=tool_result,
-                            ))
-                        except Exception as e:
-                            logger.error("[%s] Tool '%s' execution error: %s", req_id, tool_name, e)
-                            conversation_messages.append(ChatMessage(
-                                role="tool",
-                                content=f"Error: {str(e)}",
-                            ))
-
-                # If we have client tool calls, break and return them
-                if client_tool_calls:
-                    logger.info("[%s] Returning %d client tool calls", req_id, len(client_tool_calls))
-                    final_tool_calls = client_tool_calls
-                    break
-
-            elapsed = int((time.time() - start) * 1000)
-
-            logger.info("[%s] ── Complete ── provider=%s tokens=%d+%d time=%dms",
-                        req_id, provider.name, total_prompt_tokens, total_completion_tokens, elapsed)
-
-            # Log usage (fire-and-forget)
-            asyncio.create_task(
-                log_usage(
-                    _session, _config.supabase_url, _config.supabase_service_key,
-                    key_info["id"], key_info["user_id"],
-                    MODEL_NAME,
-                    f"{API_PREFIX}/chat/completions",
-                    total_prompt_tokens, total_completion_tokens,
-                    200, elapsed, provider.name,
-                )
-            )
-
-            # Determine finish reason
-            finish_reason = final_finish_reason
-            if final_tool_calls:
-                finish_reason = "tool_calls"
-
-            response_data = {
-                "id": f"si-{int(start * 1000)}",
-                "object": "chat.completion",
-                "created": int(start),
-                "model": MODEL_NAME,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_content,
-                    },
-                    "finish_reason": finish_reason,
-                }],
-                "usage": {
-                    "prompt_tokens": total_prompt_tokens,
-                    "completion_tokens": total_completion_tokens,
-                    "total_tokens": total_prompt_tokens + total_completion_tokens,
-                },
-            }
-
-            # Add tool_calls if present
-            if final_tool_calls:
-                response_data["choices"][0]["message"]["tool_calls"] = final_tool_calls
-
-            return JSONResponse(response_data)
-
-        except Exception as e:
-            last_error = str(e)
-            logger.warning("[%s] Provider %s failed: %s", req_id, provider.name, last_error)
-            if _router:
-                _router.mark_unhealthy(provider.name)
-            continue
-
-    logger.error("[%s] All providers failed. Last error: %s", req_id, last_error)
-    raise HTTPException(status_code=502, detail=f"All providers failed: {last_error}")
+def _is_first_turn(messages: list[dict]) -> bool:
+    """
+    Heuristic: treat as a brand-new session if we have no assistant/tool turns yet.
+    Messages come in OpenAI-style dicts: {role, content}.
+    """
+    for msg in messages:
+        role = msg.get("role")
+        if role in ("assistant", "tool"):
+            return False
+    return True
 
 
-# ─── Streaming with fallback ─────────────────────────────────────────────────
+def _enforce_api_key_profile(key_info: dict, path: str) -> None:
+    """
+    Enforce API key profile restrictions.
+    JWT-authenticated users (id starts with 'jwt-') are not restricted here.
+    """
+    key_id = str(key_info.get("id", ""))
+    if key_id.startswith("jwt-"):
+        return
 
-async def _stream_with_fallback(
-    chat_request: ChatRequest,
-    chain: list,
-    key_info: dict,
-    task_type,
-    start: float,
-    client_tools: list,
-    req_id: str = "",
-):
-    """Stream from the first working provider. Handles tool execution loop."""
-    prompt_tokens = 0
-    completion_tokens = 0
-    provider_used = ""
-    original_tools = list(chat_request.tools) if chat_request.tools else None
+    profile = (key_info.get("profile") or "universal").strip()
+    if profile == "universal":
+        return
 
-    for provider in chain:
-        try:
-            logger.info("[%s] Streaming via provider: %s (model=%s)", req_id, provider.name, provider.default_model)
-            chat_request.model = provider.default_model
-            
-            # Convert tools to provider format (use copy so fallback gets original)
-            if original_tools:
-                chat_request.tools = ProviderToolMapper.to_provider_format(
-                    original_tools, provider.name
-                )
-            else:
-                chat_request.tools = None
+    # OpenAI-compat keys should not hit Superintelligence endpoints.
+    if profile == "openai_compat":
+        raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
 
-            # Tool execution loop for streaming (simplified - tools handled on final chunk)
-            conversation_messages = list(chat_request.messages)
-            accumulated_content = ""
-            accumulated_tool_calls = None
-            iteration = 0
-            max_iterations = 5
-            should_continue_loop = False
+    # Coding keys are restricted to /coding/* and basic metadata.
+    if profile == "coding_superintelligence":
+        allowed_prefixes = (
+            f"{API_PREFIX}/coding/",
+            f"{API_PREFIX}/health",
+            f"{API_PREFIX}/models",
+        )
+        if not path.startswith(allowed_prefixes):
+            raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
+        return
 
-            while iteration < max_iterations:
-                chat_request.messages = conversation_messages
-                iteration += 1
-                should_continue_loop = False
+    # Unknown profile: deny by default.
+    raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
 
-                async for chunk in provider.stream_chat_completion(chat_request):
-                    if chunk.prompt_tokens:
-                        prompt_tokens = chunk.prompt_tokens
-                    if chunk.completion_tokens:
-                        completion_tokens = chunk.completion_tokens
 
-                    # Accumulate content
-                    if chunk.content:
-                        accumulated_content += chunk.content
-
-                    # Send content chunks
-                    if chunk.content:
-                        sse_data = {
-                            "id": f"si-{int(start * 1000)}",
-                            "object": "chat.completion.chunk",
-                            "created": int(start),
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": chunk.content},
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(sse_data)}\n\n"
-
-                    # Handle tool calls on final chunk
-                    if chunk.done:
-                        if chunk.tool_calls_delta:
-                            accumulated_tool_calls = chunk.tool_calls_delta
-
-                        # Separate server-side and client-side tool calls
-                        if accumulated_tool_calls:
-                            server_tool_calls = []
-                            client_tool_calls = []
-                            client_tool_names = {tool.get("function", {}).get("name") for tool in client_tools if tool.get("type") == "function"}
-
-                            for tc in accumulated_tool_calls:
-                                tool_name = tc.get("function", {}).get("name", "")
-                                if _tool_registry and _tool_registry.is_server_tool(tool_name):
-                                    if not ProviderToolMapper.is_native_tool(tool_name, provider.name):
-                                        server_tool_calls.append(tc)
-                                elif tool_name in client_tool_names:
-                                    client_tool_calls.append(tc)
-
-                            # Execute server-side tools and continue loop
-                            if server_tool_calls:
-                                for tc in server_tool_calls:
-                                    tool_name = tc.get("function", {}).get("name", "")
-                                    tool_args_str = tc.get("function", {}).get("arguments", "{}")
-                                    logger.info("[%s] Executing server tool: %s", req_id, tool_name)
-                                    try:
-                                        tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                                        tool_result = await _tool_registry.execute(tool_name, tool_args)
-                                        
-                                        conversation_messages.append(ChatMessage(role="assistant", content=accumulated_content))
-                                        conversation_messages.append(ChatMessage(role="tool", content=tool_result))
-                                        accumulated_content = ""  # Reset for next iteration
-                                        accumulated_tool_calls = None
-                                        should_continue_loop = True
-                                    except Exception as e:
-                                        logger.error("[%s] Tool '%s' execution error: %s", req_id, tool_name, e)
-
-                                # Continue to next iteration if we executed server tools
-                                if should_continue_loop:
-                                    break
-
-                            # If client tool calls, send them and finish
-                            if client_tool_calls:
-                                sse_data = {
-                                    "id": f"si-{int(start * 1000)}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(start),
-                                    "model": MODEL_NAME,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"tool_calls": client_tool_calls},
-                                        "finish_reason": "tool_calls",
-                                    }],
-                                }
-                                yield f"data: {json.dumps(sse_data)}\n\n"
-                                yield "data: [DONE]\n\n"
-                                
-                                elapsed = int((time.time() - start) * 1000)
-                                logger.info("[%s] ── Stream complete (tool_calls) ── provider=%s time=%dms",
-                                            req_id, provider.name, elapsed)
-                                await log_usage(
-                                    _session, _config.supabase_url, _config.supabase_service_key,
-                                    key_info["id"], key_info["user_id"],
-                                    MODEL_NAME,
-                                    f"{API_PREFIX}/chat/completions",
-                                    prompt_tokens, completion_tokens,
-                                    200, elapsed, provider_used,
-                                )
-                                return
-
-                        # No tool calls, finish normally
-                        sse_data = {
-                            "id": f"si-{int(start * 1000)}",
-                            "object": "chat.completion.chunk",
-                            "created": int(start),
-                            "model": MODEL_NAME,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": chunk.finish_reason or "stop",
-                            }],
-                        }
-                        yield f"data: {json.dumps(sse_data)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        
-                        elapsed = int((time.time() - start) * 1000)
-                        logger.info("[%s] ── Stream complete ── provider=%s tokens=%d+%d time=%dms",
-                                    req_id, provider.name, prompt_tokens, completion_tokens, elapsed)
-                        await log_usage(
-                            _session, _config.supabase_url, _config.supabase_service_key,
-                            key_info["id"], key_info["user_id"],
-                            MODEL_NAME,
-                            f"{API_PREFIX}/chat/completions",
-                            prompt_tokens, completion_tokens,
-                            200, elapsed, provider_used,
-                        )
-                        return  # Success — don't try next provider
-
-                # If we should continue loop (server tools executed), continue
-                if should_continue_loop:
-                    continue
-                
-                # Otherwise, we completed an iteration without tool calls
-                break
-
-            # If we exhausted iterations, finish
-            if iteration >= max_iterations:
-                logger.warning("[%s] Max tool iterations (%d) reached", req_id, max_iterations)
-                yield "data: [DONE]\n\n"
-                elapsed = int((time.time() - start) * 1000)
-                await log_usage(
-                    _session, _config.supabase_url, _config.supabase_service_key,
-                    key_info["id"], key_info["user_id"],
-                    MODEL_NAME,
-                    f"{API_PREFIX}/chat/completions",
-                    prompt_tokens, completion_tokens,
-                    200, elapsed, provider_used,
-                )
-                return
-
-        except Exception as e:
-            logger.warning("[%s] Stream provider %s failed: %s", req_id, provider.name, e)
-            if _router:
-                _router.mark_unhealthy(provider.name)
-            continue
-
-    logger.error("[%s] All stream providers failed", req_id)
-    # All providers failed
-    error_chunk = {
-        "id": f"si-{int(start * 1000)}",
-        "object": "chat.completion.chunk",
-        "model": MODEL_NAME,
-        "choices": [{
-            "index": 0,
-            "delta": {"content": "Error: All providers unavailable. Please try again."},
-            "finish_reason": "stop",
-        }],
-    }
-    yield f"data: {json.dumps(error_chunk)}\n\n"
-    yield "data: [DONE]\n\n"
+#
+# Note: legacy fallback implementations were moved to
+# `superintelligence/http/completion_service.py`.

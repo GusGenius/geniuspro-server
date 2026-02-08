@@ -254,12 +254,13 @@ class AnthropicProvider(BaseProvider):
         self, request: ChatRequest, model: str, stream: bool
     ) -> dict:
         """Build the Anthropic Messages API payload."""
-        system_prompt = ""
+        system_prompts: list[str] = []
         messages = []
 
         for msg in request.messages:
             if msg.role == "system":
-                system_prompt = msg.content
+                if msg.content:
+                    system_prompts.append(msg.content)
             else:
                 messages.append({"role": msg.role, "content": msg.content})
 
@@ -270,8 +271,10 @@ class AnthropicProvider(BaseProvider):
             "stream": stream,
         }
 
-        if system_prompt:
-            payload["system"] = system_prompt
+        if system_prompts:
+            # Anthropic Messages API supports a single "system" string.
+            # We preserve multiple system messages by concatenating in order.
+            payload["system"] = "\n\n".join(system_prompts)
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         if request.top_p is not None:
