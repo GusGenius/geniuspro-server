@@ -40,8 +40,8 @@ async def log_usage(
     """
     Log a request to Supabase usage_logs.
 
-    The model field always shows 'geniuspro-superintelligence-v1'.
-    The provider_used field is internal-only metadata.
+    The model field should reflect the client-requested model id (e.g. gp-agi-1.2).
+    The provider_used field is internal-only metadata and is not exposed to clients.
     """
     url = f"{supabase_url}/rest/v1/usage_logs"
     payload = {

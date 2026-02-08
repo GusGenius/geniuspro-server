@@ -172,7 +172,16 @@ async def health() -> dict:
     provider_names = list(_router.providers.keys()) if _router else []
     return {
         "status": "ok",
-        "service": "geniuspro-superintelligence-v1",
+        "service": MODEL_NAME,
+        "providers": len(provider_names),
+    }
+
+@app.get(f"{CODING_API_PREFIX}/health")
+async def coding_health() -> dict:
+    provider_names = list(_router.providers.keys()) if _router else []
+    return {
+        "status": "ok",
+        "service": CODING_MODEL_NAME,
         "providers": len(provider_names),
     }
 
@@ -188,6 +197,20 @@ async def list_models(request: Request) -> dict:
         "data": [
             {
                 "id": MODEL_NAME,
+                "object": "model",
+                "owned_by": "geniuspro",
+            }
+        ],
+    }
+
+@app.get(f"{CODING_API_PREFIX}/models")
+async def list_coding_models(request: Request) -> dict:
+    await _auth(request)
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": CODING_MODEL_NAME,
                 "object": "model",
                 "owned_by": "geniuspro",
             }
