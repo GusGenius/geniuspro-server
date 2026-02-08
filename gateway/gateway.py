@@ -38,6 +38,13 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 VOICE_SERVER_URL = os.environ.get("VOICE_SERVER_URL", "http://localhost:8001")
 
+# Public model names → internal Ollama model tags.
+# Clients send the capitalized public name; Ollama uses lowercase tags.
+_PUBLIC_TO_OLLAMA: dict[str, str] = {
+    "GeniusPro-coder-v1": "geniuspro-coder-v1",
+}
+
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="GeniusPro API Gateway", docs_url=None, redoc_url=None)
@@ -222,12 +229,12 @@ async def list_models(key_info: dict = Depends(require_auth)):
         "object": "list",
         "data": [
             {
-                "id": "geniuspro-coder-v1",
+                "id": "GeniusPro-coder-v1",
                 "object": "model",
                 "owned_by": "geniuspro",
             },
             {
-                "id": "geniuspro-voice",
+                "id": "GeniusPro-voice-v1",
                 "object": "model",
                 "owned_by": "geniuspro",
             },
@@ -244,15 +251,18 @@ async def chat_completions(
     start = time.time()
     body = await request.json()
 
-    model = body.get("model", "geniuspro-coder-v1")
+    model = body.get("model", "GeniusPro-coder-v1")
     messages = body.get("messages", [])
     stream = body.get("stream", False)
 
     logger.info("Gateway /v1/chat/completions model=%s stream=%s msgs=%d user=%s",
                 model, stream, len(messages), key_info.get("user_id", "?")[:8])
 
+    # Map public model names to internal Ollama model names
+    ollama_model = _PUBLIC_TO_OLLAMA.get(model, model)
+
     # Build Ollama payload
-    ollama_payload = {"model": model, "messages": messages, "stream": stream}
+    ollama_payload = {"model": ollama_model, "messages": messages, "stream": stream}
 
     # Map OpenAI params to Ollama options
     options = {}
@@ -492,7 +502,7 @@ async def voice_proxy(ws: WebSocket):
         await log_usage(
             key_info["id"],
             key_info["user_id"],
-            "geniuspro-voice",
+            "GeniusPro-voice-v1",
             "/v1/voice",
             0,
             0,

@@ -57,11 +57,9 @@ logger = logging.getLogger("superintelligence")
 
 # Public “model” identifiers (what clients send in requests).
 MODEL_NAME = "GeniusPro-agi-1.2"
-CODING_MODEL_NAME = "geniuspro-coding-agi-1.2"
+CODING_MODEL_NAME = "GeniusPro-coding-agi-1.2"
 
 # Legacy aliases (accepted for backwards compatibility).
-LEGACY_MODEL_NAME = "gp-agi-1.2"
-LEGACY_CODING_MODEL_NAME = "gp-coding-agi-1.2"
 
 # Public base URLs (what clients configure as base_url).
 API_PREFIX = "/superintelligence/v1"
