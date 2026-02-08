@@ -56,8 +56,12 @@ logger = logging.getLogger("superintelligence")
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 # Public “model” identifiers (what clients send in requests).
-MODEL_NAME = "gp-agi-1.2"
-CODING_MODEL_NAME = "gp-coding-agi-1.2"
+MODEL_NAME = "GeniusPro-agi-1.2"
+CODING_MODEL_NAME = "geniuspro-coding-agi-1.2"
+
+# Legacy aliases (accepted for backwards compatibility).
+LEGACY_MODEL_NAME = "gp-agi-1.2"
+LEGACY_CODING_MODEL_NAME = "gp-coding-agi-1.2"
 
 # Public base URLs (what clients configure as base_url).
 API_PREFIX = "/superintelligence/v1"
@@ -311,6 +315,7 @@ async def coding_chat_completions(request: Request):
         start=start,
         req_id=req_id,
         endpoint=str(request.url.path),
+        model_name=CODING_MODEL_NAME,
     )
 
 
@@ -455,6 +460,7 @@ async def _run_completion(
     start: float,
     req_id: str,
     endpoint: str,
+    model_name: str = MODEL_NAME,
 ):
     if not _config or not _session or not _router:
         raise HTTPException(status_code=503, detail="Service not ready")
@@ -474,7 +480,7 @@ async def _run_completion(
         session=_session,
         router=_router,
         tool_registry=_tool_registry,
-        model_name=MODEL_NAME,
+        model_name=model_name,
     )
 
     if chat_request.stream:

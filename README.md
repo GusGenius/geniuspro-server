@@ -41,8 +41,8 @@ Coding (Cursor) base URL: `https://api.geniuspro.io/coding-superintelligence/v1`
 Legacy base URL (backwards compatible): `https://api.geniuspro.io/super-intelligence/v1`
 
 Models:
-- `gp-agi-1.2` (regular)
-- `gp-coding-agi-1.2` (coding / Cursor)
+- `GeniusPro-agi-1.2` (regular)
+- `geniuspro-coding-agi-1.2` (coding / Cursor)
 
 | Endpoint | Method | Auth |
 |----------|--------|------|
