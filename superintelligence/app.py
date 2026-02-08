@@ -55,8 +55,16 @@ logger = logging.getLogger("superintelligence")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-MODEL_NAME = "geniuspro-superintelligence-v1"
-API_PREFIX = "/super-intelligence/v1"
+# Public “model” identifiers (what clients send in requests).
+MODEL_NAME = "gp-agi-1.2"
+CODING_MODEL_NAME = "gp-coding-agi-1.2"
+
+# Public base URLs (what clients configure as base_url).
+API_PREFIX = "/superintelligence/v1"
+CODING_API_PREFIX = "/coding-superintelligence/v1"
+
+# Backwards-compatible legacy prefix (older deployments / docs).
+LEGACY_API_PREFIX = "/super-intelligence/v1"
 DEFAULT_SYSTEM_PROMPT = (
     "You are GeniusPro, a helpful AI assistant created by GeniusPro. "
     "Be concise, friendly, and helpful. Never identify as any other AI or company. "
@@ -159,6 +167,7 @@ async def _auth(request: Request) -> dict:
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 @app.get(f"{API_PREFIX}/health")
+@app.get(f"{LEGACY_API_PREFIX}/health")
 async def health() -> dict:
     provider_names = list(_router.providers.keys()) if _router else []
     return {
@@ -171,6 +180,7 @@ async def health() -> dict:
 # ─── Models ───────────────────────────────────────────────────────────────────
 
 @app.get(f"{API_PREFIX}/models")
+@app.get(f"{LEGACY_API_PREFIX}/models")
 async def list_models(request: Request) -> dict:
     await _auth(request)
     return {
@@ -188,6 +198,7 @@ async def list_models(request: Request) -> dict:
 # ─── Chat Completions ────────────────────────────────────────────────────────
 
 @app.post(f"{API_PREFIX}/chat/completions", response_model=None)
+@app.post(f"{LEGACY_API_PREFIX}/chat/completions", response_model=None)
 async def chat_completions(request: Request):
     req_id = uuid.uuid4().hex[:8]
     key_info = await _auth(request)
@@ -221,13 +232,15 @@ async def chat_completions(request: Request):
         key_info=key_info,
         start=start,
         req_id=req_id,
-        endpoint=f"{API_PREFIX}/chat/completions",
+        endpoint=str(request.url.path),
     )
 
 
 # ─── Coding-specific Superintelligence ───────────────────────────────────────
 
+@app.post(f"{CODING_API_PREFIX}/chat/completions", response_model=None)
 @app.post(f"{API_PREFIX}/coding/chat/completions", response_model=None)
+@app.post(f"{LEGACY_API_PREFIX}/coding/chat/completions", response_model=None)
 async def coding_chat_completions(request: Request):
     req_id = uuid.uuid4().hex[:8]
     key_info = await _auth(request)
@@ -241,7 +254,8 @@ async def coding_chat_completions(request: Request):
     # If the client starts a new session with no user message yet,
     # return the onboarding question immediately.
     if not messages:
-        return JSONResponse(build_onboarding_response(model_name=MODEL_NAME))
+        model_name = CODING_MODEL_NAME if str(request.url.path).startswith(CODING_API_PREFIX) else MODEL_NAME
+        return JSONResponse(build_onboarding_response(model_name=model_name))
 
     if messages[0].get("role") != "system":
         messages.insert(0, {"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
@@ -273,11 +287,13 @@ async def coding_chat_completions(request: Request):
         key_info=key_info,
         start=start,
         req_id=req_id,
-        endpoint=f"{API_PREFIX}/coding/chat/completions",
+        endpoint=str(request.url.path),
     )
 
 
+@app.post(f"{CODING_API_PREFIX}/summarize", response_model=None)
 @app.post(f"{API_PREFIX}/coding/summarize", response_model=None)
+@app.post(f"{LEGACY_API_PREFIX}/coding/summarize", response_model=None)
 async def coding_summarize(request: Request):
     req_id = uuid.uuid4().hex[:8]
     key_info = await _auth(request)
@@ -313,13 +329,15 @@ async def coding_summarize(request: Request):
         key_info=key_info,
         start=start,
         req_id=req_id,
-        endpoint=f"{API_PREFIX}/coding/summarize",
+        endpoint=str(request.url.path),
     )
 
 
 # ─── Coding memory (user-approved snippets only) ─────────────────────────────
 
+@app.post(f"{CODING_API_PREFIX}/memory/snippets", response_model=None)
 @app.post(f"{API_PREFIX}/coding/memory/snippets", response_model=None)
+@app.post(f"{LEGACY_API_PREFIX}/coding/memory/snippets", response_model=None)
 async def coding_memory_save_snippet(request: Request):
     key_info = await _auth(request)
     _enforce_api_key_profile(key_info, request.url.path)
@@ -370,7 +388,9 @@ async def coding_memory_save_snippet(request: Request):
         raise HTTPException(status_code=502, detail=msg)
 
 
+@app.get(f"{CODING_API_PREFIX}/memory/snippets", response_model=None)
 @app.get(f"{API_PREFIX}/coding/memory/snippets", response_model=None)
+@app.get(f"{LEGACY_API_PREFIX}/coding/memory/snippets", response_model=None)
 async def coding_memory_list_snippets(request: Request):
     key_info = await _auth(request)
     _enforce_api_key_profile(key_info, request.url.path)
@@ -486,20 +506,36 @@ def _enforce_api_key_profile(key_info: dict, path: str) -> None:
     if key_id.startswith("jwt-"):
         return
 
-    profile = (key_info.get("profile") or "universal").strip()
+    profile = (key_info.get("profile") or "openai_compat").strip()
+
+    # Legacy support: "universal" used to mean "works everywhere".
+    # We no longer issue universal keys; allow but warn so users rotate.
     if profile == "universal":
+        logger.warning("Legacy API key profile 'universal' used for %s — rotate this key", path)
         return
 
-    # OpenAI-compat keys should not hit Superintelligence endpoints.
+    # Regular Superintelligence keys (used with /superintelligence/v1/*).
     if profile == "openai_compat":
+        # Allow only the regular surface (and its legacy prefix), not the coding surface.
+        if path.startswith(f"{CODING_API_PREFIX}/"):
+            raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
+        if path.startswith((f"{API_PREFIX}/", f"{LEGACY_API_PREFIX}/")):
+            # Block legacy coding endpoints under the regular surface.
+            if "/coding/" in path:
+                raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
+            return
         raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
 
-    # Coding keys are restricted to /coding/* and basic metadata.
+    # Coding Superintelligence keys are restricted to coding surface + basic metadata.
     if profile == "coding_superintelligence":
         allowed_prefixes = (
+            f"{CODING_API_PREFIX}/",
             f"{API_PREFIX}/coding/",
+            f"{LEGACY_API_PREFIX}/coding/",
             f"{API_PREFIX}/health",
             f"{API_PREFIX}/models",
+            f"{LEGACY_API_PREFIX}/health",
+            f"{LEGACY_API_PREFIX}/models",
         )
         if not path.startswith(allowed_prefixes):
             raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")

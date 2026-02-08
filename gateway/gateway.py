@@ -190,8 +190,11 @@ async def require_auth(request: Request) -> dict:
 
 
 def _enforce_api_key_profile(key_info: dict, path: str) -> None:
-    profile = (key_info.get("profile") or "universal").strip()
+    profile = (key_info.get("profile") or "openai_compat").strip()
+    # Legacy support: "universal" used to mean "works everywhere".
+    # We no longer issue universal keys; treat them as allowed here but encourage rotation.
     if profile == "universal":
+        logger.warning("Legacy API key profile 'universal' used for %s — rotate this key", path)
         return
     if profile == "openai_compat":
         return
