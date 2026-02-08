@@ -198,6 +198,9 @@ def _enforce_api_key_profile(key_info: dict, path: str) -> None:
         return
     if profile == "openai_compat":
         return
+    # Gateway keys are valid for the /v1 surface.
+    if profile == "gateway":
+        return
     # Coding Superintelligence keys are not valid for the gateway /v1 surface.
     if profile == "coding_superintelligence":
         raise HTTPException(status_code=403, detail="API key profile does not allow this endpoint")
