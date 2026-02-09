@@ -10,6 +10,7 @@ Production AI server powering the GeniusPro API platform.
 | **API Gateway** | 8000 | Auth, proxy, usage logging |
 | **Superintelligence** | 8100 | Superintelligence + Coding Superintelligence surfaces |
 | **Voice Server** | 8001 | Real-time speech-to-speech (internal) |
+| **Vision Service** | 8200 | SAM 2 image and video segmentation |
 | **Nginx** | 80 | Reverse proxy for `api.geniuspro.io` |
 
 **Hardware:** RTX 5090 (32GB VRAM), Ubuntu Server  
@@ -53,6 +54,23 @@ Models:
 | `/coding-superintelligence/v1/models` | GET | API key |
 | `/coding-superintelligence/v1/chat/completions` | POST | API key |
 
+### Vision Service (`/vision/v1`)
+
+Base URL: `https://api.geniuspro.io/vision/v1`
+
+Models:
+- `GeniusPro-vision-sam2`
+
+| Endpoint | Method | Auth |
+|----------|--------|------|
+| `/vision/v1/health` | GET | none |
+| `/vision/v1/models` | GET | API key |
+| `/vision/v1/segment-image` | POST | API key |
+| `/vision/v1/segment-video/init` | POST | API key |
+| `/vision/v1/segment-video/add-prompt` | POST | API key |
+| `/vision/v1/segment-video/propagate` | POST | API key |
+| `/vision/v1/segment-video/cleanup` | POST | API key |
+
 ## API Key Profiles
 
 API keys in Supabase `api_keys.profile` control which surface(s) a key can access:
@@ -60,6 +78,7 @@ API keys in Supabase `api_keys.profile` control which surface(s) a key can acces
 - `openai_compat`: **Superintelligence** (`/superintelligence/v1/*`, legacy `/super-intelligence/v1/*`)
 - `coding_superintelligence`: **Coding Superintelligence** (`/coding-superintelligence/v1/*`)
 - `gateway`: **Gateway** (`/v1/*`) for `geniuspro-coder-v1` and `geniuspro-voice`
+- `vision`: **Vision Service** (`/vision/v1/*`) for SAM 2 image/video segmentation
 - `universal`: legacy (allowed, but should be rotated)
 
 ## Auth Flow
@@ -79,6 +98,7 @@ ssh -F config geniuspro
 sudo systemctl status geniuspro-gateway
 sudo systemctl status geniuspro-superintelligence
 sudo systemctl status geniuspro-voice
+sudo systemctl status geniuspro-vision
 sudo systemctl status ollama
 sudo systemctl status nginx
 
@@ -86,11 +106,13 @@ sudo systemctl status nginx
 sudo journalctl -u geniuspro-gateway -f
 sudo journalctl -u geniuspro-superintelligence -f
 sudo journalctl -u geniuspro-voice -f
+sudo journalctl -u geniuspro-vision -f
 
 # Restart
 sudo systemctl restart geniuspro-gateway
 sudo systemctl restart geniuspro-superintelligence
 sudo systemctl restart geniuspro-voice
+sudo systemctl restart geniuspro-vision
 
 # GPU
 nvidia-smi
@@ -112,6 +134,13 @@ geniuspro-server/
 │   ├── requirements.txt
 │   ├── .env.example
 │   └── geniuspro-superintelligence.service
+├── vision/
+│   ├── app.py                          # Vision API (FastAPI)
+│   ├── sam2_predictor.py               # SAM 2 wrapper
+│   ├── config.py                        # Configuration
+│   ├── requirements.txt
+│   ├── geniuspro-vision.service
+│   └── README.md                        # Vision service docs
 └── voice-server/
     ├── server.py                       # Voice S2S server (FastAPI)
     └── client.html                     # Web client for voice
@@ -131,6 +160,12 @@ ssh -F config geniuspro "sudo systemctl restart geniuspro-voice"
 # Deploy superintelligence changes
 scp -F config superintelligence/app.py geniuspro:~/geniuspro-superintelligence/superintelligence/
 ssh -F config geniuspro "sudo systemctl restart geniuspro-superintelligence"
+
+# Deploy vision service changes
+scp -F config vision/app.py geniuspro:~/geniuspro-vision/vision/
+scp -F config vision/sam2_predictor.py geniuspro:~/geniuspro-vision/vision/
+scp -F config vision/config.py geniuspro:~/geniuspro-vision/vision/
+ssh -F config geniuspro "sudo systemctl restart geniuspro-vision"
 
 # Deploy nginx changes
 scp -F config gateway/nginx-geniuspro-api.conf geniuspro:~/geniuspro-gateway/

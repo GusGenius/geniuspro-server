@@ -1,0 +1,19 @@
+fastapi
+uvicorn[standard]
+aiohttp
+python-multipart
+numpy>=1.26,<2
+pillow
+torch>=2.7.0
+torchvision>=0.20.1
+opencv-python-headless<4.13
+huggingface_hub
+setuptools<70
+einops
+decord
+pycocotools
+# Roboflow provider uses direct HTTP (no SDK needed for Python 3.13+)
+# SAM 3 must be installed separately via:
+# git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e ".[notebooks]"
+# Requires Python 3.12+ and CUDA 12.6+
+# OR use Roboflow API provider (no local installation needed) - set SAM3_PROVIDER=roboflow
